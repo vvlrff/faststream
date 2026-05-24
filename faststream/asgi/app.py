@@ -130,9 +130,12 @@ class AsgiFastStream(Application):
             self.routes.append((asyncapi_route.path, handler))
 
             if asyncapi_route.try_it_out and self.brokers:
+                self.schema.to_specification()
+
                 try_it_out_route = make_try_it_out_handler(
                     self.brokers,
                     include_in_schema=asyncapi_route.include_in_schema,
+                    operation_to_broker=self.schema.operation_to_broker,
                 )
                 try_it_out_route.update_fd_config(self.config)
                 try_it_out_route.set_logger(logger)

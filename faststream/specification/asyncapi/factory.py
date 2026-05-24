@@ -43,6 +43,10 @@ class AsyncAPI(SpecificationFactory):
 
         self.http_handlers: list[tuple[str, HttpHandler]] = []
 
+        # Populated by `to_specification()`: `{operation_key: broker}` for v3+
+        # so try-it-out can dispatch the request to the correct broker.
+        self.operation_to_broker: dict[str, BrokerUsecase[Any, Any]] = {}
+
     def add_broker(
         self,
         broker: "BrokerUsecase[Any, Any]",
@@ -61,6 +65,8 @@ class AsyncAPI(SpecificationFactory):
         return self
 
     def to_specification(self) -> Specification:
+        # Reset and let the generator repopulate; spec is rebuilt fresh.
+        self.operation_to_broker.clear()
         if self.schema_version.startswith("3."):
             from .v3_0_0 import get_app_schema as schema_3_0
 
@@ -77,6 +83,7 @@ class AsyncAPI(SpecificationFactory):
                 tags=self.tags,
                 external_docs=self.external_docs,
                 http_handlers=self.http_handlers,
+                operation_to_broker=self.operation_to_broker,
             )
 
         if self.schema_version.startswith("2.6."):

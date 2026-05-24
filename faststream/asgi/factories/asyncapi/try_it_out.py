@@ -1,4 +1,4 @@
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import suppress
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, TypedDict, Union
@@ -44,15 +44,30 @@ class TryItOutForm(TypedDict):
 
 
 class TryItOutProcessor:
-    """Dispatch try-it-out requests; first broker owning the channel handles it."""
+    """Dispatch try-it-out requests.
 
-    def __init__(self, brokers: Iterable["BrokerUsecase[Any, Any]"]) -> None:
+    Primary: `operation_id` from the plugin payload looked up in the
+    operation→broker map built by the AsyncAPI v3+ generator. This is the
+    standard AsyncAPI 3.0 identifier and gives unambiguous routing even when
+    multiple brokers expose the same destination.
+
+    Fallback (single-broker apps, payloads without operation_id, AsyncAPI v2.6):
+    parse `channelName`, find the first broker that owns the destination.
+    """
+
+    def __init__(
+        self,
+        brokers: Iterable["BrokerUsecase[Any, Any]"],
+        operation_to_broker: Mapping[str, "BrokerUsecase[Any, Any]"] | None = None,
+    ) -> None:
         registry = _get_broker_registry()
         self._entries: list[tuple[BrokerUsecase[Any, Any], type[TestBroker[Any]]]] = []
+        self._test_broker_cls: dict[int, type[TestBroker[Any]]] = {}
         for broker in brokers:
             for br_cls, test_broker_cls in registry.items():
                 if isinstance(broker, br_cls):
                     self._entries.append((broker, test_broker_cls))
+                    self._test_broker_cls[id(broker)] = test_broker_cls
                     break
             else:
                 msg = f"TestBroker not available for {broker}. Please, inspect your dependencies."
@@ -62,6 +77,10 @@ class TryItOutProcessor:
             msg = "TryItOutProcessor requires at least one broker."
             raise ValueError(msg)
 
+        self._operation_to_broker: Mapping[str, BrokerUsecase[Any, Any]] = (
+            operation_to_broker or {}
+        )
+
     async def process(self, body: TryItOutForm) -> AsgiResponse:
         """Process parsed body: validate, dry-run or publish. Returns response."""
         destination, *_ = body.get("channelName", "").split(":")
@@ -69,22 +88,33 @@ class TryItOutProcessor:
         if not destination:
             return JSONResponse({"details": "Missing channelName"}, 400)
 
-        if len(self._entries) == 1:
-            broker, test_broker_cls = self._entries[0]
-        else:
-            entry = next(
-                (
-                    e
-                    for e in self._entries
-                    if destination in _iter_broker_destinations(e[0])
-                ),
-                None,
-            )
-            if entry is None:
-                return JSONResponse(
-                    {"details": f"{destination} destination not found."}, 404
+        operation_id = body.get("message", {}).get("operation_id") or ""
+
+        # Primary: operation_id → broker (AsyncAPI 3.0 standard identifier).
+        broker = self._operation_to_broker.get(operation_id)
+        test_broker_cls: type[TestBroker[Any]] | None = (
+            self._test_broker_cls.get(id(broker)) if broker is not None else None
+        )
+
+        # Fallback: by destination (single broker, v2.6, or unknown operation_id).
+        if broker is None or test_broker_cls is None:
+            if len(self._entries) == 1:
+                broker, test_broker_cls = self._entries[0]
+            else:
+                entry = next(
+                    (
+                        e
+                        for e in self._entries
+                        if destination in _iter_broker_destinations(e[0])
+                    ),
+                    None,
                 )
-            broker, test_broker_cls = entry
+                if entry is None:
+                    return JSONResponse(
+                        {"details": f"{destination} destination not found."}, 404
+                    )
+                broker, test_broker_cls = entry
+
         payload: Any = body.get("message", {}).get("message")
         use_real_broker = body.get("options", {}).get("sendToRealBroker", False)
 
@@ -115,9 +145,14 @@ def make_try_it_out_handler(
     tags: Sequence[Union["Tag", "TagDict", dict[str, Any]]] | None = None,
     unique_id: str | None = None,
     include_in_schema: bool = False,
+    operation_to_broker: Mapping[str, "BrokerUsecase[Any, Any]"] | None = None,
 ) -> "PostHandler":
-    """POST handler for asyncapi-try-it-plugin (first owner of the channel wins)."""
-    processor = TryItOutProcessor(brokers)
+    """POST handler for asyncapi-try-it-plugin.
+
+    Dispatch priority: operation_id from payload (standard AsyncAPI 3.0 ID),
+    then destination fallback for single-broker / v2.6 / unknown ops.
+    """
+    processor = TryItOutProcessor(brokers, operation_to_broker=operation_to_broker)
 
     @post(
         description=description,

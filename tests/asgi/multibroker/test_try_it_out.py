@@ -140,3 +140,84 @@ class TestProcessorUnit:
     def test_empty_brokers_rejected(self) -> None:
         with pytest.raises(ValueError, match="at least one broker"):
             TryItOutProcessor([])
+
+
+def _payload_op(channel: str, op_id: str, body: Any) -> dict[str, Any]:
+    return {
+        "channelName": channel,
+        "message": {
+            "operation_id": op_id,
+            "operation_type": "subscribe",
+            "message": body,
+        },
+        "options": {"sendToRealBroker": False},
+    }
+
+
+class TestOperationIdDispatch:
+    """Dispatch via operation_id is the AsyncAPI 3.0 standard path.
+
+    The plugin sends `operation_id` from the spec; we look it up in the
+    factory-built `operation_to_broker` map to pick the right broker even
+    when multiple brokers serve the same destination.
+    """
+
+    @pytest.mark.asyncio()
+    async def test_dispatch_by_operation_id_picks_correct_broker(self) -> None:
+        kafka = KafkaBroker()
+        redis = RedisBroker()
+
+        kafka_mock = MagicMock()
+        redis_mock = MagicMock()
+
+        # Different function names → distinct channel/operation keys:
+        # ping:KafkaPingSubscribe (kafka), ping:RedisPingSubscribe (redis).
+        @kafka.subscriber("ping")
+        async def kafka_ping(msg: Any) -> None:
+            kafka_mock(msg)
+
+        @redis.subscriber("ping")
+        async def redis_ping(msg: Any) -> None:
+            redis_mock(msg)
+
+        app = AsgiFastStream(
+            kafka, redis, asyncapi_path=AsyncAPIRoute("/asyncapi", try_it_out=True)
+        )
+
+        async with TestKafkaBroker(kafka), TestRedisBroker(redis):
+            with TestClient(app) as client:
+                # The plugin click on "ping:RedisPing" must go to Redis, not Kafka.
+                r = client.post(
+                    "/asyncapi/try",
+                    json=_payload_op("ping:RedisPing", "ping:RedisPingSubscribe", "hi"),
+                )
+                assert r.status_code == 200, r.json()
+
+        redis_mock.assert_called_once_with("hi")
+        kafka_mock.assert_not_called()
+
+    @pytest.mark.asyncio()
+    async def test_dispatch_falls_back_when_operation_id_unknown(self) -> None:
+        """Unknown operation_id → fall back to destination-based first-owner-wins."""
+        kafka = KafkaBroker()
+        redis = RedisBroker()
+
+        kafka_mock = MagicMock()
+
+        @kafka.subscriber("kafka-only")
+        async def kh(msg: Any) -> None:
+            kafka_mock(msg)
+
+        app = AsgiFastStream(
+            kafka, redis, asyncapi_path=AsyncAPIRoute("/asyncapi", try_it_out=True)
+        )
+
+        async with TestKafkaBroker(kafka), TestRedisBroker(redis):
+            with TestClient(app) as client:
+                r = client.post(
+                    "/asyncapi/try",
+                    json=_payload_op("kafka-only", "bogus-op-id", "x"),
+                )
+                assert r.status_code == 200, r.json()
+
+        kafka_mock.assert_called_once_with("x")

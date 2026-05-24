@@ -1,12 +1,18 @@
 import string
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Optional, Union
 from urllib.parse import urlparse
 
 from faststream._internal._compat import DEF_KEY
 from faststream._internal.constants import ContentTypes
-from faststream.specification.asyncapi.utils import clear_key, move_pydantic_refs
+from faststream.specification.asyncapi.utils import (
+    resolve_key,
+    clear_key,
+    convert_list_of_dict_to_dict,
+    move_pydantic_refs,
+)
+from faststream.specification.asyncapi.v3_0_0.refs import channel_ref, message_ref
 from faststream.specification.asyncapi.v3_0_0.schema import (
     ApplicationInfo,
     ApplicationSchema,
@@ -44,24 +50,6 @@ if TYPE_CHECKING:
     )
 
 
-def convert_list_of_dict_to_dict(
-    list_of: Iterable[dict[str, Any]],
-    warn: str,
-) -> dict[str, Any]:
-    items: dict[str, Any] = {}
-    for it in list_of:
-        for key, value in it.items():
-            if (exist := items.get(key)) and value != exist:
-                warnings.warn(
-                    f"Overwrite broker {warn} for an application, {warn} have the same names: `{key}`",
-                    RuntimeWarning,
-                    stacklevel=1,
-                )
-            items[key] = value
-
-    return items
-
-
 def get_app_schema(
     *brokers: "BrokerUsecase[Any, Any]",
     title: str,
@@ -75,8 +63,13 @@ def get_app_schema(
     tags: Sequence[Union["SpecTag", "TagDict", dict[str, Any]]] | None,
     external_docs: Union["SpecDocs", "ExternalDocsDict", dict[str, Any]] | None,
     http_handlers: list[tuple[str, "HttpHandler"]],
+    operation_to_broker: dict[str, "BrokerUsecase[Any, Any]"] | None = None,
 ) -> ApplicationSchema:
-    """Get the application schema."""
+    """Get the application schema.
+
+    If `operation_to_broker` is provided, it is populated with
+    `{operation_key: broker}` after key uniqueness adjustments.
+    """
     if any(br.specification.security for br in brokers):
         list_of_specification_security = (
             br.specification.security.get_schema()
@@ -92,14 +85,13 @@ def get_app_schema(
 
     servers, broker_servers = get_broker_server(*brokers)
 
-    list_of_channels_operations = [
-        get_broker_channels(br, servers=srv) for br, srv in broker_servers.items()
-    ]
-    list_of_channels = (itchannel for itchannel, _ in list_of_channels_operations)
-    list_of_operations = (itoperation for _, itoperation in list_of_channels_operations)
+    channels: dict[str, Channel] = {}
+    operations: dict[str, Operation] = {}
 
-    channels = convert_list_of_dict_to_dict(list_of_channels, "channel")
-    operations = convert_list_of_dict_to_dict(list_of_operations, "operation")
+    for broker, srv_names in broker_servers.items():
+        populate_broker_spec(
+            broker, srv_names, channels, operations, operation_to_broker,
+        )
 
     messages: dict[str, Message] = {}
     payloads: dict[str, dict[str, Any]] = {}
@@ -131,7 +123,7 @@ def get_app_schema(
             termsOfService=terms_of_service,
             contact=Contact.from_spec(contact),
             license=License.from_spec(license),
-            tags=[Tag.from_spec(tag) for tag in tags] or None if tags else None,
+            tags=[Tag.from_spec(tag) for tag in tags] if tags else None,
             externalDocs=ExternalDocs.from_spec(external_docs),
         ),
         asyncapi=schema_version,
@@ -206,79 +198,70 @@ def get_broker_server(
     return servers_by_names, broker_server_names
 
 
-def get_broker_channels(
-    broker: "BrokerUsecase[MsgType, ConnectionType]", servers: list[str] | None = None
-) -> tuple[dict[str, Channel], dict[str, Operation]]:
-    """Get the broker channels for an application."""
-    channels = {}
-    operations = {}
+def populate_broker_spec(
+    broker: "BrokerUsecase[MsgType, ConnectionType]",
+    servers: list[str] | None,
+    channels: dict[str, Channel],
+    operations: dict[str, Operation],
+    operation_to_broker: dict[str, "BrokerUsecase[Any, Any]"] | None = None,
+) -> None:
+    # Snapshot keys owned by earlier brokers — used to tell cross-broker
+    # collisions (rename + ChannelKeyCollisionWarning) from within-broker
+    # ones (overwrite + legacy RuntimeWarning).
+    pre_channels = set(channels)
+    pre_operations = set(operations)
 
-    channel_servers = [
-        {"$ref": f"#/servers/{server_name}"} for server_name in (servers or ())
+    server_refs = [
+        Reference(**{"$ref": f"#/servers/{server_name}"})
+        for server_name in (servers or ())
     ] or None
 
     for sub in filter(lambda s: s.specification.include_in_schema, broker.subscribers):
         for sub_key, sub_channel in sub.schema().items():
-            channel_obj = Channel.from_sub(sub_key, sub_channel, servers=channel_servers)
+            ch_key = resolve_key(clear_key(sub_key), channels, pre_channels, "channel")
+            channels[ch_key] = Channel.from_sub(sub_key, sub_channel, servers=server_refs)
 
-            channel_key = clear_key(sub_key)
-            if channel_key in channels:
-                warnings.warn(
-                    f"Overwrite channel handler, channels have the same names: `{channel_key}`",
-                    RuntimeWarning,
-                    stacklevel=1,
-                )
-
-            channels[channel_key] = channel_obj
-
-            operation_key = (
-                f"{channel_key}Subscribe"
-                if sub.specification.config.title_ is None
-                or sub.specification.config.title_ == "/"
-                else sub.specification.config.title_
-            )
-            if operation_key in operations:
-                warnings.warn(
-                    f"Overwrite channel handler, operations have the same names: `{operation_key}`",
-                    RuntimeWarning,
-                    stacklevel=1,
-                )
-
-            operations[operation_key] = Operation.from_sub(
-                messages=[
-                    Reference(**{
-                        "$ref": f"#/channels/{channel_key}/messages/{msg_name}",
-                    })
-                    for msg_name in channel_obj.messages
-                ],
-                channel=Reference(**{"$ref": f"#/channels/{channel_key}"}),
+            title = sub.specification.config.title_
+            op_base = f"{ch_key}Subscribe" if title in (None, "/") else title
+            op_key = resolve_key(op_base, operations, pre_operations, "operation")
+            operations[op_key] = Operation.from_sub(
+                messages=[message_ref(ch_key, m) for m in channels[ch_key].messages],
+                channel=channel_ref(ch_key),
                 operation=sub_channel.operation,
             )
+            if operation_to_broker is not None:
+                operation_to_broker[op_key] = broker
 
     for pub in filter(lambda p: p.specification.include_in_schema, broker.publishers):
         for pub_key, pub_channel in pub.schema().items():
-            channel_obj = Channel.from_pub(pub_key, pub_channel, servers=channel_servers)
-
-            channel_key = clear_key(pub_key)
-            if channel_key in channels:
-                warnings.warn(
-                    f"Overwrite channel handler, channels have the same names: `{channel_key}`",
-                    RuntimeWarning,
-                    stacklevel=1,
-                )
-            channels[channel_key] = channel_obj
-
-            operations[channel_key] = Operation.from_pub(
-                messages=[
-                    Reference(**{
-                        "$ref": f"#/channels/{channel_key}/messages/{msg_name}",
-                    })
-                    for msg_name in channel_obj.messages
-                ],
-                channel=Reference(**{"$ref": f"#/channels/{channel_key}"}),
+            ch_key = resolve_key(clear_key(pub_key), channels, pre_channels, "channel")
+            channels[ch_key] = Channel.from_pub(pub_key, pub_channel, servers=server_refs)
+            operations[ch_key] = Operation.from_pub(
+                messages=[message_ref(ch_key, m) for m in channels[ch_key].messages],
+                channel=channel_ref(ch_key),
                 operation=pub_channel.operation,
             )
+            if operation_to_broker is not None:
+                operation_to_broker[ch_key] = broker
 
+
+def get_broker_channels(
+    broker: "BrokerUsecase[MsgType, ConnectionType]",
+    servers: list[str] | None = None,
+) -> tuple[dict[str, Channel], dict[str, Operation]]:
+    """Deprecated. Use `populate_broker_spec` and pass accumulators in.
+
+    Kept as a thin shim for backwards compatibility with external code
+    (plugins, custom AsyncAPI generators) that imported this name.
+    """
+    warnings.warn(
+        "get_broker_channels is deprecated; use populate_broker_spec instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    channels: dict[str, Channel] = {}
+    operations: dict[str, Operation] = {}
+    populate_broker_spec(broker, servers, channels, operations, None)
     return channels, operations
 
 
@@ -304,7 +287,7 @@ def get_asgi_routes(
             channels[channel_name] = channel
             operation = Operation(
                 action=Action.RECEIVE,
-                channel=Reference(**{"$ref": f"#/channels/{channel_name}"}),
+                channel=channel_ref(channel_name),
                 bindings=OperationBinding(
                     http=http_bindings.OperationBinding(
                         method=_get_http_binding_method(asgi_app.methods),

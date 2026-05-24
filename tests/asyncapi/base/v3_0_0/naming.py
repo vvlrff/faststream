@@ -134,7 +134,12 @@ class MultibrokersSchema(BaseNaming):
             })
         })
 
-        # def test_multi_subscribers_conflict(self) -> None:
+    def test_multi_subscribers_conflict(
+        self, recwarn: pytest.WarningsRecorder
+    ) -> None:
+        """Same subscriber function name on two brokers used to overwrite
+        each other (silent data loss). Now they coexist via a `_2`
+        discriminator on both channel and operation keys."""
         broker_first = self.broker_class(description="1")
 
         @broker_first.subscriber("test")
@@ -145,12 +150,19 @@ class MultibrokersSchema(BaseNaming):
         @broker_second.subscriber("test")
         async def handle_broker() -> None: ...  # noqa: F811
 
-        with pytest.warns(RuntimeWarning, match=r"test[\w:]*:HandleBroke"):
-            schema = self.get_spec(broker_first, broker_second).to_jsonable()
+        schema = self.get_spec(broker_first, broker_second).to_jsonable()
 
-        assert list(schema["channels"].keys()) == [
-            IsStr(regex=r"test[\w:]*:HandleBroker")
+        overwrite_warnings = [
+            w for w in recwarn.list if "Overwrite" in str(w.message)
         ]
+        assert overwrite_warnings == [], [w.message for w in overwrite_warnings]
+
+        channel_keys = list(schema["channels"])
+        assert any(k.endswith("_2") for k in channel_keys), channel_keys
+        # Each channel still points to its own server.
+        servers_a = {s["$ref"] for s in schema["channels"][channel_keys[0]]["servers"]}
+        servers_b = {s["$ref"] for s in schema["channels"][channel_keys[1]]["servers"]}
+        assert servers_a != servers_b
 
 
 class SubscriberNaming(BaseNaming):

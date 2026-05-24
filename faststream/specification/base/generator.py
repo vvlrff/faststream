@@ -16,6 +16,8 @@ class SpecificationFactory(Protocol):
     contact: Union["Contact", dict[str, Any]] | None
     license: Union["License", dict[str, Any]] | None
 
+    operation_to_broker: dict[str, "BrokerUsecase[Any, Any]"]
+
     @abstractmethod
     def add_broker(
         self,

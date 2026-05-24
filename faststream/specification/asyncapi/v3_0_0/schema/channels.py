@@ -26,7 +26,7 @@ class Channel(BaseModel):
 
     address: str
     description: str | None = None
-    servers: list[dict[str, str]] | None = None
+    servers: list[Reference] | None = None
     messages: dict[str, Message | Reference]
     bindings: ChannelBinding | None = None
 
@@ -46,7 +46,7 @@ class Channel(BaseModel):
         cls,
         address: str,
         subscriber: SubscriberSpec,
-        servers: list[dict[str, str]] | None = None,
+        servers: list[Reference] | None = None,
     ) -> Self:
         message = subscriber.operation.message
         assert message.title
@@ -69,7 +69,7 @@ class Channel(BaseModel):
         cls,
         address: str,
         publisher: PublisherSpec,
-        servers: list[dict[str, str]] | None = None,
+        servers: list[Reference] | None = None,
     ) -> Self:
         return cls(
             description=publisher.description,
